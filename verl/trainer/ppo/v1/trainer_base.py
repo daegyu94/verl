@@ -171,6 +171,7 @@ class PPOTrainer(ABC):
             filter_groups_metric = self._resolve_filter_groups_metric()
             sync_refill_failed_groups = bool(sampler_config.get("sync_refill_failed_groups", False))
             replay_buffer_kwargs.update(
+                poll_interval=sampler_config.get("poll_interval", 2.0),
                 filter_groups_metric=filter_groups_metric,
                 sync_refill_failed_groups=sync_refill_failed_groups,
             )

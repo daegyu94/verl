@@ -163,3 +163,14 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
         "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
         10,
     )
+
+
+def test_builtin_sampler_forwards_poll_interval_without_changing_custom_contract():
+    for mode in ("sync", "colocate_async", "separate_async"):
+        trainer = _trainer_with_filter_groups({"enable": False}, trainer_mode=mode)
+        assert trainer._build_replay_buffer().poll_interval == 2.0
+        trainer.config.trainer.v1.sampler.poll_interval = 0.05
+        assert trainer._build_replay_buffer().poll_interval == 0.05
+        trainer.config.trainer.v1.sampler.custom_sampler = {"path": "custom.py", "name": "CustomSampler"}
+        with patch("verl.trainer.ppo.v1.trainer_base.load_extern_type", return_value=_CustomSampler):
+            assert "poll_interval" not in trainer._build_replay_buffer().kwargs

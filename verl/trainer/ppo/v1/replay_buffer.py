@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import math
 import os
 import time
 from collections import Counter, defaultdict
@@ -148,6 +149,8 @@ class ReplayBuffer:
         self.max_off_policy_threshold = max_off_policy_threshold
         self.max_off_policy_strategy = max_off_policy_strategy
         self.sampler_kwargs = sampler_kwargs
+        if not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValueError("poll_interval must be finite and greater than zero")
         self.poll_interval = poll_interval
         self.refill_fn = refill_fn
         self.filter_groups_metric = filter_groups_metric

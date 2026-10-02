@@ -1252,3 +1252,9 @@ def test_wait_for_sampleable_replaces_groups_sample_would_have_evicted(tq_init, 
         assert _uids_of(batch.keys) == {refiller.produced_uids[0]}
     finally:
         _clear_partition(partition_id)
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("nan"), float("inf")])
+def test_init_rejects_invalid_poll_interval(interval):
+    with pytest.raises(ValueError, match="poll_interval"):
+        _make_rb(poll_interval=interval)

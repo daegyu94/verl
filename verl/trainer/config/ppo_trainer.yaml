@@ -281,6 +281,9 @@ trainer:
     # Replay buffer sampling strategy
     sampler:
 
+      # Seconds between metadata polls; shorter intervals increase metadata traffic.
+      poll_interval: 2.0
+
       # Maximum number of model versions that trajectory can span
       max_off_policy_threshold: 8
 
