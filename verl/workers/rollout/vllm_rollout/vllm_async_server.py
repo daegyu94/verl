@@ -662,6 +662,19 @@ class vLLMHttpServer:
         while self._submission_paused:
             logger.debug("parking request %s until weight sync completes", request_id)
             await self._resume_event.wait()
+        if os.environ.get("VERL_POLICY_CACHE_SALT") == "1":
+            # Namespace prefix KV by policy weights. A caller-supplied namespace
+            # can remain stable across controlled populate/read jobs; production
+            # defaults to the Ray job id to prevent accidental cross-job reuse.
+            # Capture this after the submission gate: there is no await between
+            # here and engine.generate(), so a weight update cannot pair a stale
+            # salt with a new LoRA adapter.
+            policy_version = self.global_steps if self.global_steps is not None else "initial"
+            namespace = os.environ.get("VERL_KV_CACHE_NAMESPACE", f"verl:{os.environ['VERL_RAY_JOB_ID']}")
+            salt_parts = [namespace, str(policy_version)]
+            if os.environ.get("VERL_KV_CACHE_REPLICA_SALT") == "1":
+                salt_parts.append(f"replica-{self.replica_rank}")
+            prompt["cache_salt"] = ":".join(salt_parts)
         self._admitting += 1
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
@@ -1075,7 +1088,7 @@ class vLLMHttpServer:
                 f"({self.config.max_model_len}); raising max_num_batched_tokens from "
                 f"{self.config.max_num_batched_tokens} to {self.config.max_model_len}."
             )
-            self.config.max_num_batched_tokens = self.config.max_model_len
+            object.__setattr__(self.config, "max_num_batched_tokens", self.config.max_model_len)
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         """Called at the end of __init__. Default logs server metadata."""
