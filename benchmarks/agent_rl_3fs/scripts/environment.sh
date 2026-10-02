@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+experiment_root=${EXPERIMENT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+agent_rl_root=${AGENT_RL_REPO_ROOT:-$(cd "$experiment_root/../.." && pwd)}
+export AGENT_RL_VENV=${AGENT_RL_VENV:-"$experiment_root/.venv"}
+export VERL_ROOT="$agent_rl_root/verl"
+export THREEFS_MOUNT=${THREEFS_MOUNT:?Set the existing 3FS client mount}
+export HF3FS_RUNTIME_LIB_DIR=${HF3FS_RUNTIME_LIB_DIR:?Set the matching USRBIO library directory}
+export MOONCAKE_CONFIG_PATH="$experiment_root/configs/mooncake-3fs.json"
+export MOONCAKE_MASTER=127.0.0.1:51151 MOONCAKE_ENABLE_DFS=1
+export MOONCAKE_DFS_ROOT_DIR=${MOONCAKE_DFS_ROOT_DIR:-"$THREEFS_MOUNT/verl-lab/agent-rl-20261002"}
+export MOONCAKE_DFS_ALLOCATOR=${MOONCAKE_DFS_ALLOCATOR:-shard}
+export MOONCAKE_DFS_BUCKET_CAPACITY=268435456 MOONCAKE_DFS_MAX_BUCKET_COUNT=4
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs MOONCAKE_DFS_SHARD_COUNT=4
+export MOONCAKE_DFS_SHARD_CAPACITY=268435456 MOONCAKE_DFS_ALIGNMENT=${MOONCAKE_DFS_ALIGNMENT:-4096}
+export MOONCAKE_DFS_SINGLE_TENANT=true
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$experiment_root/runtime/offload"
+export MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 MOONCAKE_PROTOCOL=tcp MOONCAKE_DEVICE=''
+export MOONCAKE_TE_META_DATA_SERVER=P2PHANDSHAKE
+export VLLM_MOONCAKE_STORE_TIER_LOG=${VLLM_MOONCAKE_STORE_TIER_LOG:-1}
+export LD_LIBRARY_PATH="$HF3FS_RUNTIME_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$AGENT_RL_VENV/bin:$PATH"
+export PYTHONPATH="$agent_rl_root/verl:$agent_rl_root/vllm${PYTHONPATH:+:$PYTHONPATH}"
+mountpoint -q "$THREEFS_MOUNT"
+mkdir -p "$MOONCAKE_DFS_ROOT_DIR" "$MOONCAKE_OFFLOAD_FILE_STORAGE_PATH" "$experiment_root/runtime"
