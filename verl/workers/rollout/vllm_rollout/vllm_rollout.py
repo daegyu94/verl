@@ -235,6 +235,9 @@ class ServerAdapter(BaseRollout):
             kwargs={**kwargs, "use_shm": self.use_shm},
         )
 
+        if region_identity is not None and future is None:
+            raise RuntimeError("policy regions requires an acknowledged rollout weight receiver")
+
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         sender = BucketedWeightSender(
             zmq_handle=self.zmq_handle,

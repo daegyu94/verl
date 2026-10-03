@@ -23,6 +23,8 @@ def policy_identity(config, step, previous):
     )
     if not extra.get("policy_regions", False):
         return None
+    if config.get("free_cache_engine", False) or config.get("enable_sleep_mode", False):
+        raise ValueError("policy region PoC requires free_cache_engine=false and enable_sleep_mode=false")
     run_id = extra.get("policy_region_run_id")
     if not isinstance(run_id, str) or not run_id or len(run_id) > 900:
         raise ValueError("policy regions requires a unique bounded policy_region_run_id")

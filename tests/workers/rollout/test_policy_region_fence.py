@@ -58,6 +58,11 @@ class Tests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.policy_identity(CONFIG, step, 1)
 
+    def test_unsupported_gpu_cache_lifetime(self):
+        for key in ("free_cache_engine", "enable_sleep_mode"):
+            with self.assertRaises(ValueError):
+                m.policy_identity({**CONFIG, key: True}, 2, 1)
+
     def test_ack_order(self):
         e = Engine()
         asyncio.run(m.clear_policy_cache(e, "job/weights/1"))
