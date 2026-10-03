@@ -224,6 +224,9 @@ class ServerAdapter(BaseRollout):
         assert wire_format == "named_tensors", (
             f"vLLM rollout supports wire_format='named_tensors' or 'delta_flush'; got {wire_format!r}"
         )
+        from .policy_region_fence import policy_identity
+
+        region_identity = policy_identity(self.config, global_steps, getattr(self, "_region_last_step", None))
         start_time = time.time()
 
         future = await self._execute_method(
@@ -245,7 +248,11 @@ class ServerAdapter(BaseRollout):
 
         # reset caches after updating weights
         if self._has_server:
-            await self.server_handle.clear_kv_cache.remote()
+            if region_identity is None:
+                await self.server_handle.clear_kv_cache.remote()
+            else:
+                await self.server_handle.clear_kv_cache.remote(policy_identity=region_identity)
+                self._region_last_step = global_steps
             if global_steps is not None:
                 await self.server_handle.set_global_steps.remote(global_steps)
 
@@ -276,6 +283,9 @@ class ServerAdapter(BaseRollout):
                 await self.server_handle.set_global_steps.remote(global_steps)
             return
 
+        from .policy_region_fence import policy_identity
+
+        region_identity = policy_identity(self.config, global_steps, getattr(self, "_region_last_step", None))
         first_named_tensors, saw_last = first_item
         if not self._delta_weight_transfer_engine_initialized:
             await self._execute_method(
@@ -314,7 +324,11 @@ class ServerAdapter(BaseRollout):
         await self._execute_method("finish_weight_update")
 
         if self._has_server:
-            await self.server_handle.clear_kv_cache.remote()
+            if region_identity is None:
+                await self.server_handle.clear_kv_cache.remote()
+            else:
+                await self.server_handle.clear_kv_cache.remote(policy_identity=region_identity)
+                self._region_last_step = global_steps
             if global_steps is not None:
                 await self.server_handle.set_global_steps.remote(global_steps)
 

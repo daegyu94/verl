@@ -884,16 +884,11 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
-    async def clear_kv_cache(self):
+    async def clear_kv_cache(self, policy_identity: str | None = None):
         if self.node_rank == 0:
-            # reset_connector=True drops any attached external KV store
-            # (e.g. MooncakeStoreConnector) whose entries were computed
-            # against the previous model weights. With no connector it
-            # is a no-op success, so we can pass it unconditionally.
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            from .policy_region_fence import clear_policy_cache
 
-            await self.engine.reset_mm_cache()
-            await self.engine.reset_encoder_cache()
+            await clear_policy_cache(self.engine, policy_identity)
 
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""

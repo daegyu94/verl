@@ -160,6 +160,15 @@ class vLLMColocateWorkerExtension:
     2. Online FP8 quantization
     """
 
+    def transition_policy_region(self, policy_identity: str) -> bool:
+        from vllm.distributed.kv_transfer.kv_transfer_state import get_kv_transfer_group
+
+        connector = get_kv_transfer_group()
+        transition = getattr(connector, "transition_policy_region", None)
+        if transition is None:
+            raise RuntimeError("active vLLM connector has no policy region transition hook")
+        return transition(policy_identity)
+
     def __new__(cls, **kwargs):
         set_death_signal()
 
