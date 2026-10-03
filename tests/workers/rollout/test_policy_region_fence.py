@@ -148,5 +148,41 @@ class WeightHookTests(unittest.TestCase):
         self.assertEqual(obj._region_last_step, 2)
 
 
+class DeltaAckTests(unittest.TestCase):
+    def test_real_delta_flush_rejects_missing_receiver(self):
+        import ast
+        from types import SimpleNamespace as NS
+
+        source = SOURCE.with_name("vllm_rollout.py")
+        tree = ast.parse(source.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ServerAdapter")
+        delta = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_update_delta_weights")
+        fn = next(n for n in delta.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "send_flush")
+        called = []
+
+        async def execute(*args, **kwargs):
+            return None
+
+        class Sender:
+            def __init__(self, **kwargs):
+                pass
+
+            async def async_send_weights(self, weights):
+                called.append("send")
+
+        obj = NS(
+            _execute_method=execute, zmq_handle=None, config=NS(checkpoint_engine=NS(update_weights_bucket_megabytes=1))
+        )
+        scope = {"self": obj, "region_identity": "job/weights/2", "BucketedWeightSender": Sender}
+        module = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), fn],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), scope)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(scope["send_flush"]([]))
+        self.assertEqual(called, [])
+
+
 if __name__ == "__main__":
     unittest.main()

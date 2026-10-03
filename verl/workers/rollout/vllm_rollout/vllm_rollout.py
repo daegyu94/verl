@@ -305,6 +305,8 @@ class ServerAdapter(BaseRollout):
                 non_block=True,
                 kwargs={"update_info": {}},
             )
+            if region_identity is not None and receiver_future is None:
+                raise RuntimeError("policy regions requires an acknowledged delta weight receiver")
             sender = BucketedWeightSender(
                 zmq_handle=self.zmq_handle,
                 bucket_size_mb=self.config.checkpoint_engine.update_weights_bucket_megabytes,
