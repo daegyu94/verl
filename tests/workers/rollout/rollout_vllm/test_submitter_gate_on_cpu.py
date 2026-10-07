@@ -26,6 +26,7 @@ resume_generation() is coming soon.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -78,6 +79,76 @@ def _make_server(node_rank: int = 0):
     server._rejecting = False
     server._disaggregation_role = "null"
     return server
+
+
+@pytest.mark.parametrize(
+    "operation,mode",
+    [("clear_kv_cache", "colocated"), ("wake_up", "colocated"), ("wake_up", "hybrid"), ("resume_kv_cache", "hybrid")],
+)
+@pytest.mark.parametrize("reset_result", [False, RuntimeError("master unavailable")])
+def test_cache_reset_failure_stops_lifecycle(operation, mode, reset_result):
+    server = _make_server()
+    server.rollout_mode = vllm_async_server.RolloutMode(mode)
+    server.config = SimpleNamespace(free_cache_engine=True)
+    server._get_wake_up_tags = lambda: ["weights", "kv_cache"]
+    server.engine = MagicMock()
+    server.engine.wake_up = AsyncMock()
+    server.engine.reset_prefix_cache = AsyncMock(return_value=reset_result)
+    if isinstance(reset_result, Exception):
+        server.engine.reset_prefix_cache.side_effect = reset_result
+    server.engine.reset_mm_cache = AsyncMock()
+    server.engine.reset_encoder_cache = AsyncMock()
+    with pytest.raises(RuntimeError):
+        asyncio.run(getattr(server, operation)())
+    server.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
+    server.engine.reset_mm_cache.assert_not_awaited()
+    server.engine.reset_encoder_cache.assert_not_awaited()
+
+
+@pytest.mark.parametrize("node_rank", [0, 1])
+def test_cache_reset_success_clears_caches_on_engine_owner(node_rank):
+    server = _make_server(node_rank)
+    server.engine = MagicMock()
+    server.engine.reset_prefix_cache = AsyncMock(return_value=True)
+    server.engine.reset_mm_cache = AsyncMock()
+    server.engine.reset_encoder_cache = AsyncMock()
+    asyncio.run(server.clear_kv_cache())
+    assert server.engine.reset_prefix_cache.await_count == (1 if node_rank == 0 else 0)
+    assert server.engine.reset_mm_cache.await_count == (1 if node_rank == 0 else 0)
+    assert server.engine.reset_encoder_cache.await_count == (1 if node_rank == 0 else 0)
+
+
+def test_cache_reset_failure_prevents_weight_step_publication():
+    from verl.workers.rollout.vllm_rollout import vllm_rollout
+
+    server = _make_server()
+    server.engine.reset_prefix_cache = AsyncMock(return_value=False)
+    adapter = vllm_rollout.ServerAdapter.__new__(vllm_rollout.ServerAdapter)
+    adapter.use_shm = False
+    adapter.zmq_handle = "sender"
+    adapter.config = SimpleNamespace(checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=16))
+    adapter._has_server = True
+    adapter.server_handle = MagicMock()
+    adapter.server_handle.clear_kv_cache.remote = server.clear_kv_cache
+    adapter.server_handle.set_global_steps.remote = AsyncMock()
+    events = []
+
+    async def receive():
+        events.append("receive")
+
+    async def execute(*args, **kwargs):
+        return receive()
+
+    adapter._execute_method = execute
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        sender = MagicMock()
+        sender.return_value.async_send_weights = AsyncMock()
+        monkeypatch.setattr(vllm_rollout, "BucketedWeightSender", sender)
+        with pytest.raises(RuntimeError, match="failed to reset"):
+            asyncio.run(adapter.update_weights(iter([]), global_steps=7))
+    adapter.server_handle.set_global_steps.remote.assert_not_awaited()
+    assert events == ["receive"]
+    server.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
 
 
 def test_abort_does_not_pause_until_inflight_admissions_land():
