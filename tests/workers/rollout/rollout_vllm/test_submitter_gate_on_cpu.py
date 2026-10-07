@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from omegaconf import OmegaConf
 
 pytest.importorskip("ray")
 pytest.importorskip("vllm")
@@ -79,6 +80,15 @@ def _make_server(node_rank: int = 0):
     server._rejecting = False
     server._disaggregation_role = "null"
     return server
+
+
+def test_server_rejects_unprepared_mooncake_namespace_before_launch():
+    server = _make_server()
+    server.config = OmegaConf.create(
+        {"engine_kwargs": {"vllm": {"kv_transfer_config": {"kv_connector": "MooncakeStoreConnector"}}}}
+    )
+    with pytest.raises(ValueError, match="cache_prefix"):
+        asyncio.run(server.launch_server("127.0.0.1", 50051, 50052))
 
 
 @pytest.mark.parametrize(

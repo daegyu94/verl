@@ -40,6 +40,9 @@ def run_ppo(config, task_runner_class) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    from verl.workers.rollout.kv_cache_namespace import prepare_mooncake_cache_namespaces
+
+    config = prepare_mooncake_cache_namespaces(config)
     # Propagate determinism env vars from config before ray.init() so
     # get_ppo_ray_runtime_env() forwards them to all Ray actors.
     rollout_cfg = config.actor_rollout_ref.rollout
