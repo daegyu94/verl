@@ -1,6 +1,6 @@
 # Rollout KV Cache Offload via Mooncake-Store
 
-Last updated: 05/27/2026.
+Last updated: 10/07/2026.
 
 Offload prefix KV blocks from the vLLM rollout engine to a shared
 [Mooncake](https://github.com/kvcache-ai/Mooncake) store so long shared
@@ -44,6 +44,14 @@ Or as a Hydra CLI override:
 +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_role=kv_both \
 +actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config.kv_connector_extra_config.mooncake_config_path=/path/to/mooncake_config.json
 ```
+
+## Isolation between jobs
+
+`run_ppo()` assigns a fresh `cache_prefix` before sending the job configuration to Ray actors. All rollout replicas of one policy receive the same prefix; independent jobs receive different prefixes even when checkpoint paths have the same final name. Policy, reward and teacher roles have separate defaults. The dictionary and JSON forms of `kv_transfer_config`, including Store entries in `MultiConnector`, are supported.
+
+An explicit nonempty `cache_prefix` is preserved for intentional sharing and must identify the same weights and policy. Custom entrypoints that bypass `run_ppo()` must call `prepare_mooncake_cache_namespaces()` from `verl.workers.rollout.kv_cache_namespace` once before creating replicas, or configure unique prefixes themselves. Server launch rejects an unprepared Store namespace. Prefixes cannot contain `@`.
+
+Use a vLLM build with prefix-scoped Mooncake resets when multiple jobs share a Master. Earlier builds still delete the tenant's keys on reset even when keys carry different prefixes. If that build is unavailable, use a dedicated Master per job. A weight update still requires a successful local and external reset before generation resumes.
 
 ## RL correctness: hard reset on every weight update
 
