@@ -293,6 +293,10 @@ class vLLMHttpServer:
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
+        from verl.workers.rollout.kv_cache_namespace import validate_mooncake_cache_namespaces
+
+        validate_mooncake_cache_namespaces(engine_kwargs)
+
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
         override_generation_config = self._get_override_generation_config()
