@@ -902,7 +902,7 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
         if getattr(self, "_shared_store_reset", False):
-            await self.abort_all_requests(reset_prefix_cache=False)
+            await self.abort_all_requests(reset_prefix_cache=False, require_admission_barrier=True)
             await self.engine.prepare_kv_cache_reset()
         elif abort_requests:
             await self.abort_all_requests()
@@ -911,9 +911,18 @@ class vLLMHttpServer:
         if getattr(self, "_shared_store_reset", False):
             await self.clear_kv_cache()
 
-    async def finish_kv_cache_reset(self):
+    async def resume_kv_cache_reset(self, resume_generation: bool = False):
+        if getattr(self, "_shared_store_reset", False) or resume_generation:
+            await self.resume_engine_generation()
+
+    async def finish_kv_cache_reset(self, resume_generation: bool = False):
+        if getattr(self, "_shared_store_reset", False) or resume_generation:
+            await self.open_submission_gate()
+
+    async def fence_kv_cache_reset(self):
         if getattr(self, "_shared_store_reset", False):
-            await self.resume_generation()
+            self._submission_paused = True
+            self._resume_event.clear()
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -1063,6 +1072,7 @@ class vLLMHttpServer:
         reset_prefix_cache: bool = True,
         reject_request: bool = False,
         abort_only: bool = False,
+        require_admission_barrier: bool = False,
     ) -> dict[str, Any]:
         """Abort in-flight requests, optionally pausing the replica.
 
@@ -1086,6 +1096,8 @@ class vLLMHttpServer:
                 plain pause (e.g. the one inside a weight sync) restores parking.
             abort_only: Cancel in-flight requests and leave admission open.
                 reset_prefix_cache and reject_request are ignored.
+            require_admission_barrier: Fail rather than proceed when admitted
+                requests do not reach the engine before the timeout.
 
         Returns:
             dict[str, Any]: Dictionary containing:
@@ -1116,6 +1128,9 @@ class vLLMHttpServer:
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
         try:
+            require_admission_barrier = require_admission_barrier or (
+                getattr(self, "_shared_store_reset", False) and reset_prefix_cache
+            )
             # Close the gate first, then let admissions already past it land, so the pause
             # below actually covers them. Closing the gate and declaring how late arrivals
             # are handled happen together, so no request can observe one without the other.
@@ -1125,6 +1140,10 @@ class vLLMHttpServer:
             deadline = time.monotonic() + _GATE_BARRIER_TIMEOUT_S
             while self._admitting > 0:
                 if time.monotonic() > deadline:
+                    if require_admission_barrier:
+                        raise TimeoutError(
+                            f"Submission admission barrier timed out with {self._admitting} admission(s) in flight"
+                        )
                     logger.warning(
                         "Submission gate barrier timed out with %d admission(s) in flight, proceeding",
                         self._admitting,
@@ -1506,8 +1525,14 @@ class vLLMReplica(RolloutReplica):
     async def complete_kv_cache_reset(self):
         await self._reset_phase("complete_kv_cache_reset")
 
-    async def finish_kv_cache_reset(self):
-        await self._reset_phase("finish_kv_cache_reset")
+    async def resume_kv_cache_reset(self, resume_generation: bool = False):
+        await self._reset_phase("resume_kv_cache_reset", resume_generation=resume_generation)
+
+    async def finish_kv_cache_reset(self, resume_generation: bool = False):
+        await self._reset_phase("finish_kv_cache_reset", resume_generation=resume_generation)
+
+    async def fence_kv_cache_reset(self):
+        await self._reset_phase("fence_kv_cache_reset")
 
     def __init__(
         self,

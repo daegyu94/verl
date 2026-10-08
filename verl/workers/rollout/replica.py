@@ -288,7 +288,14 @@ class RolloutReplica(ABC):
     async def complete_kv_cache_reset(self):
         return None
 
-    async def finish_kv_cache_reset(self):
+    async def resume_kv_cache_reset(self, resume_generation: bool = False):
+        if resume_generation:
+            await self.resume_generation()
+
+    async def finish_kv_cache_reset(self, resume_generation: bool = False):
+        return None
+
+    async def fence_kv_cache_reset(self):
         return None
 
     async def resume_generation(self):

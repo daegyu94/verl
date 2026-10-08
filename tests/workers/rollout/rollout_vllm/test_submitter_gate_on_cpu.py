@@ -355,7 +355,7 @@ def test_shared_store_prepares_without_deleting_before_manager_barrier():
     server.engine.prepare_kv_cache_reset = AsyncMock()
     server.clear_kv_cache = AsyncMock()
     asyncio.run(server.prepare_kv_cache_reset())
-    server.abort_all_requests.assert_awaited_once_with(reset_prefix_cache=False)
+    server.abort_all_requests.assert_awaited_once_with(reset_prefix_cache=False, require_admission_barrier=True)
     server.engine.prepare_kv_cache_reset.assert_awaited_once()
     server.clear_kv_cache.assert_not_awaited()
     asyncio.run(server.complete_kv_cache_reset())
@@ -371,6 +371,57 @@ def test_shared_store_preparation_failure_keeps_reset_uncommitted():
     with pytest.raises(RuntimeError, match="pending transfer"):
         asyncio.run(server.prepare_kv_cache_reset())
     server.clear_kv_cache.assert_not_awaited()
+
+
+def test_shared_store_admission_timeout_fences_weight_update(monkeypatch):
+    from verl.checkpoint_engine import base
+
+    async def run():
+        server = _make_server()
+        server._shared_store_reset = True
+        server._admitting = 1
+        server.engine.prepare_kv_cache_reset = AsyncMock()
+        server.engine.resume_generation = AsyncMock()
+        server.clear_kv_cache = AsyncMock()
+        manager = base.CheckpointEngineManager.__new__(base.CheckpointEngineManager)
+        manager.backend = "naive"
+        manager.replicas = [server]
+        manager.actor_wg = SimpleNamespace(update_weights=MagicMock(return_value=[]))
+        with pytest.raises(TimeoutError, match="admission"):
+            await manager.update_weights(global_steps=8)
+        assert server._submission_paused
+        assert not server._resume_event.is_set()
+        assert server.engine.pause_calls == 0
+        server.engine.prepare_kv_cache_reset.assert_not_awaited()
+        server.clear_kv_cache.assert_not_awaited()
+        manager.actor_wg.update_weights.assert_not_called()
+        server.engine.resume_generation.assert_not_awaited()
+
+    monkeypatch.setattr(vllm_async_server, "_GATE_BARRIER_TIMEOUT_S", -1)
+    monkeypatch.setattr(base.ray, "get", lambda values: values)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("shared_store", [False, True])
+def test_plain_abort_preserves_best_effort_admission_timeout(monkeypatch, shared_store):
+    server = _make_server()
+    server._shared_store_reset = shared_store
+    server._admitting = 1
+    monkeypatch.setattr(vllm_async_server, "_GATE_BARRIER_TIMEOUT_S", -1)
+    asyncio.run(server.abort_all_requests(reset_prefix_cache=False))
+    assert server.engine.pause_calls == 1
+    assert server._submission_paused
+
+
+def test_direct_shared_store_clear_rejects_admission_timeout(monkeypatch):
+    server = _make_server()
+    server._shared_store_reset = True
+    server._admitting = 1
+    monkeypatch.setattr(vllm_async_server, "_GATE_BARRIER_TIMEOUT_S", -1)
+    with pytest.raises(TimeoutError, match="admission"):
+        asyncio.run(server.abort_all_requests())
+    assert server.engine.pause_calls == 0
+    assert server._submission_paused
 
 
 def test_shared_store_prepare_skips_headless_node():
