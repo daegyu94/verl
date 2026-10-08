@@ -60,3 +60,10 @@ to avoid reusing KV from the previous policy.
 
 **Required vLLM version**: use vLLM 0.22 or newer. Older builds may leave stale
 KV in the Mooncake master after a weight update.
+
+
+### Shared Mooncake reset barrier
+
+Mooncake namespaces remain job/role scoped, rather than policy-versioned. For every weight update, the checkpoint manager first waits for all managed replicas to prepare reset: close admission without deleting shared keys, drain every TP/DP worker, synchronize CUDA copies, and invalidate each client's local cache. It then performs strict deletion on every replica before updating weights; preparation/deletion failures leave the prepared replicas paused and prevent resume.
+
+The paired vLLM and Mooncake changes are required. Strict deletion rejects incomplete metadata, replication/processing work, and pending HA finalization; a nonnegative best-effort removal count alone is insufficient. RealClient supports the strict/local-invalidation APIs, while unsupported dummy/IPC clients fail closed. External replicas sharing an explicit prefix must join the same barrier. Custom checkpoint entrypoints and independent managers must provide equivalent coordination; whole-trainer crash recovery and policy-generation isolation remain separate work.

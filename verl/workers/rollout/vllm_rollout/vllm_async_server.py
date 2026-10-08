@@ -296,6 +296,9 @@ class vLLMHttpServer:
         from verl.workers.rollout.kv_cache_namespace import validate_mooncake_cache_namespaces
 
         validate_mooncake_cache_namespaces(engine_kwargs)
+        from verl.workers.rollout.kv_cache_namespace import uses_mooncake_store
+
+        self._shared_store_reset = uses_mooncake_store(engine_kwargs)
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -892,6 +895,23 @@ class vLLMHttpServer:
         if not await self.engine.reset_prefix_cache(reset_connector=True):
             raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
 
+    async def prepare_kv_cache_reset(self, abort_requests: bool = True):
+        if self.node_rank != 0:
+            return
+        if getattr(self, "_shared_store_reset", False):
+            await self.abort_all_requests(reset_prefix_cache=False)
+            await self.engine.prepare_kv_cache_reset()
+        elif abort_requests:
+            await self.abort_all_requests()
+
+    async def complete_kv_cache_reset(self):
+        if getattr(self, "_shared_store_reset", False):
+            await self.clear_kv_cache()
+
+    async def finish_kv_cache_reset(self):
+        if getattr(self, "_shared_store_reset", False):
+            await self.resume_generation()
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
@@ -1451,6 +1471,24 @@ class vLLMHttpServer:
 
 
 class vLLMReplica(RolloutReplica):
+    async def _reset_phase(self, phase, **kwargs):
+        results = await asyncio.gather(
+            *[getattr(server, phase).remote(**kwargs) for server in self.servers],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def prepare_kv_cache_reset(self, abort_requests: bool = True):
+        await self._reset_phase("prepare_kv_cache_reset", abort_requests=abort_requests)
+
+    async def complete_kv_cache_reset(self):
+        await self._reset_phase("complete_kv_cache_reset")
+
+    async def finish_kv_cache_reset(self):
+        await self._reset_phase("finish_kv_cache_reset")
+
     def __init__(
         self,
         replica_rank: int,
