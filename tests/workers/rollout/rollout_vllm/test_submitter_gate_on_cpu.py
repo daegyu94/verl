@@ -341,11 +341,11 @@ def test_shared_store_prepares_without_deleting_before_manager_barrier():
     server.abort_all_requests = AsyncMock()
     server.engine.prepare_kv_cache_reset = AsyncMock()
     server.clear_kv_cache = AsyncMock()
-    asyncio.run(server.prepare_kv_cache_reset())
+    generation = asyncio.run(server.prepare_kv_cache_reset())
     server.abort_all_requests.assert_awaited_once_with(reset_prefix_cache=False, require_admission_barrier=True)
     server.engine.prepare_kv_cache_reset.assert_awaited_once()
     server.clear_kv_cache.assert_not_awaited()
-    asyncio.run(server.complete_kv_cache_reset())
+    asyncio.run(server.complete_kv_cache_reset(reset_generation=generation))
     server.clear_kv_cache.assert_awaited_once()
 
 
