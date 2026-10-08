@@ -177,6 +177,9 @@ class vLLMHttpServer:
         # Set by abort_all_requests(reject_request=True) when no resume is coming soon.
         self._rejecting = False
 
+        self._kv_reset_generation: str | None = None
+        self._kv_reset_participated = False
+
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port = None
@@ -898,29 +901,50 @@ class vLLMHttpServer:
         if not await self.engine.reset_prefix_cache(reset_connector=True):
             raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
 
+    def _check_kv_reset_generation(self, reset_generation: str | None):
+        if getattr(self, "_shared_store_reset", False) and (
+            reset_generation is None or reset_generation != getattr(self, "_kv_reset_generation", None)
+        ):
+            raise RuntimeError("Stale or missing shared KV reset generation")
+
     async def prepare_kv_cache_reset(self, abort_requests: bool = True):
-        if self.node_rank != 0:
-            return
         if getattr(self, "_shared_store_reset", False):
-            await self.abort_all_requests(reset_prefix_cache=False, require_admission_barrier=True)
-            await self.engine.prepare_kv_cache_reset()
-        elif abort_requests:
+            generation = uuid.uuid4().hex
+            self._kv_reset_generation = generation
+            self._kv_reset_participated = True
+            self._submission_paused = True
+            self._resume_event.clear()
+            if self.node_rank == 0:
+                await self.abort_all_requests(reset_prefix_cache=False, require_admission_barrier=True)
+                await self.engine.prepare_kv_cache_reset()
+            self._check_kv_reset_generation(generation)
+            return generation
+        if self.node_rank == 0 and abort_requests:
             await self.abort_all_requests()
+        return None
 
-    async def complete_kv_cache_reset(self):
+    async def complete_kv_cache_reset(self, reset_generation: str | None = None):
         if getattr(self, "_shared_store_reset", False):
+            self._check_kv_reset_generation(reset_generation)
             await self.clear_kv_cache()
+            self._check_kv_reset_generation(reset_generation)
 
-    async def resume_kv_cache_reset(self, resume_generation: bool = False):
+    async def resume_kv_cache_reset(self, resume_generation: bool = False, reset_generation: str | None = None):
         if getattr(self, "_shared_store_reset", False) or resume_generation:
+            self._check_kv_reset_generation(reset_generation)
             await self.resume_engine_generation()
+            self._check_kv_reset_generation(reset_generation)
 
-    async def finish_kv_cache_reset(self, resume_generation: bool = False):
+    async def finish_kv_cache_reset(self, resume_generation: bool = False, reset_generation: str | None = None):
         if getattr(self, "_shared_store_reset", False) or resume_generation:
-            await self.open_submission_gate()
+            await self.open_submission_gate(reset_generation=reset_generation)
 
-    async def fence_kv_cache_reset(self):
+    async def fence_kv_cache_reset(self, reset_generation: str | None = None):
         if getattr(self, "_shared_store_reset", False):
+            if reset_generation is not None and reset_generation != getattr(self, "_kv_reset_generation", None):
+                return
+            self._kv_reset_generation = None
+            self._kv_reset_participated = True
             self._submission_paused = True
             self._resume_event.clear()
 
@@ -1183,16 +1207,18 @@ class vLLMHttpServer:
         if self.node_rank == 0:
             await self.engine.resume_generation()
 
-    async def open_submission_gate(self):
+    async def open_submission_gate(self, reset_generation: str | None = None):
         """Admit requests after the replica has finished resuming its engines."""
+        if getattr(self, "_kv_reset_participated", False):
+            self._check_kv_reset_generation(reset_generation)
         self._rejecting = False
         self._submission_paused = False
         self._resume_event.set()
 
-    async def resume_generation(self):
+    async def resume_generation(self, reset_generation: str | None = None):
         """Resume generation after abort_all_requests (pause_generation)."""
         await self.resume_engine_generation()
-        await self.open_submission_gate()
+        await self.open_submission_gate(reset_generation=reset_generation)
 
     async def _park_until_admitted(self, request_id: str) -> Optional[TokenOutput]:
         """Wait out a closed gate, or fail the request when the gate rejects late arrivals.
@@ -1511,16 +1537,29 @@ class vLLMHttpServer:
 
 class vLLMReplica(RolloutReplica):
     async def _reset_phase(self, phase, **kwargs):
+        generations = getattr(self, "_kv_reset_generations", None)
         results = await asyncio.gather(
-            *[getattr(server, phase).remote(**kwargs) for server in self.servers],
+            *[
+                getattr(server, phase).remote(
+                    **kwargs,
+                    **(
+                        {"reset_generation": generations[i] if generations is not None else None}
+                        if phase != "prepare_kv_cache_reset"
+                        else {}
+                    ),
+                )
+                for i, server in enumerate(self.servers)
+            ],
             return_exceptions=True,
         )
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+        return results
 
     async def prepare_kv_cache_reset(self, abort_requests: bool = True):
-        await self._reset_phase("prepare_kv_cache_reset", abort_requests=abort_requests)
+        self._kv_reset_generations = None
+        self._kv_reset_generations = await self._reset_phase("prepare_kv_cache_reset", abort_requests=abort_requests)
 
     async def complete_kv_cache_reset(self):
         await self._reset_phase("complete_kv_cache_reset")
@@ -1677,7 +1716,7 @@ class vLLMReplica(RolloutReplica):
         # closed during this resume too: new requests could otherwise start a
         # DP wave while only some ranks are still in the resume collective.
         await self.servers[0].resume_engine_generation.remote()
-        await asyncio.gather(*[server.open_submission_gate.remote() for server in self.servers])
+        await self._reset_phase("open_submission_gate")
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.
