@@ -37,6 +37,11 @@ def _transfer_config(engine_kwargs):
     return value
 
 
+def uses_mooncake_store(engine_kwargs) -> bool:
+    transfer = _transfer_config(engine_kwargs)
+    return bool(transfer and any(_store_connectors(transfer)))
+
+
 def validate_mooncake_cache_namespaces(engine_kwargs) -> None:
     """Reject a Store configuration without an isolated prefix at server startup."""
     transfer = _transfer_config(engine_kwargs)

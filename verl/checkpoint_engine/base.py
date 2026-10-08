@@ -506,6 +506,15 @@ class CheckpointEngineManager:
         """
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
+    async def _cache_reset_phase(self, phase, **kwargs):
+        results = await asyncio.gather(
+            *[getattr(replica, phase)(**kwargs) for replica in self.replicas],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
     @auto_await
     async def update_weights(self, global_steps: int = None):
         """Update weights from actor worker group to rollout replicas.
@@ -514,13 +523,16 @@ class CheckpointEngineManager:
             global_steps: The global steps of the actor worker group.
         """
 
+        await self._cache_reset_phase("prepare_kv_cache_reset", abort_requests=self.backend != "naive")
+        await self._cache_reset_phase("complete_kv_cache_reset")
+
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
+            await self._cache_reset_phase("finish_kv_cache_reset")
             return {}
 
-        # 1. abort and save all unfinished requests for partial rollout
-        await self.abort_replicas()
+        # 1. all replicas are paused and the shared store reset was acknowledged.
 
         # 2. create a temporay worker group for all replicas
         workers = []

@@ -348,6 +348,37 @@ def test_abort_all_requests_abort_only_releases_parallel_sampling_parents():
     asyncio.run(main())
 
 
+def test_shared_store_prepares_without_deleting_before_manager_barrier():
+    server = _make_server()
+    server._shared_store_reset = True
+    server.abort_all_requests = AsyncMock()
+    server.engine.prepare_kv_cache_reset = AsyncMock()
+    server.clear_kv_cache = AsyncMock()
+    asyncio.run(server.prepare_kv_cache_reset())
+    server.abort_all_requests.assert_awaited_once_with(reset_prefix_cache=False)
+    server.engine.prepare_kv_cache_reset.assert_awaited_once()
+    server.clear_kv_cache.assert_not_awaited()
+    asyncio.run(server.complete_kv_cache_reset())
+    server.clear_kv_cache.assert_awaited_once()
+
+
+def test_shared_store_preparation_failure_keeps_reset_uncommitted():
+    server = _make_server()
+    server._shared_store_reset = True
+    server.abort_all_requests = AsyncMock()
+    server.engine.prepare_kv_cache_reset = AsyncMock(side_effect=RuntimeError("pending transfer"))
+    server.clear_kv_cache = AsyncMock()
+    with pytest.raises(RuntimeError, match="pending transfer"):
+        asyncio.run(server.prepare_kv_cache_reset())
+    server.clear_kv_cache.assert_not_awaited()
+
+
+def test_shared_store_prepare_skips_headless_node():
+    server = _make_server(node_rank=1)
+    server._shared_store_reset = True
+    asyncio.run(server.prepare_kv_cache_reset())
+
+
 def test_snapshot_rejects_pd_disaggregation():
     async def main():
         server = _make_server()
