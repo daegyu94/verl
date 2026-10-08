@@ -1,6 +1,6 @@
 # Rollout KV Cache Offload via Mooncake-Store
 
-Last updated: 10/07/2026.
+Last updated: 10/08/2026.
 
 Offload prefix KV blocks from the vLLM rollout engine to a shared
 [Mooncake](https://github.com/kvcache-ai/Mooncake) store so long shared
@@ -63,6 +63,8 @@ KV in the Mooncake master after a weight update.
 
 
 ### Shared Mooncake reset barrier
+
+An admission timeout during shared reset preparation raises an error and keeps admission closed; deletion and weight updates cannot proceed. Ordinary abort without a shared-cache clear retains its best-effort timeout behavior. After a successful weight update, every managed engine must resume before any shared Store submission gate opens. A resume or gate-opening error triggers re-fencing of reachable shared gates and propagates the original failure; unreachable processes and already admitted requests still require recovery rather than an atomic rollback.
 
 Mooncake namespaces remain job/role scoped, rather than policy-versioned. For every weight update, the checkpoint manager first waits for all managed replicas to prepare reset: close admission without deleting shared keys, drain every TP/DP worker, synchronize CUDA copies, and invalidate each client's local cache. It then performs strict deletion on every replica before updating weights; preparation/deletion failures leave the prepared replicas paused and prevent resume.
 
