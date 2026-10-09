@@ -29,6 +29,7 @@ _preprocess_sampling_params before admission, _postprocess_output after release.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -76,6 +77,7 @@ class _FakeEngine:
 
     async def reset_prefix_cache(self, reset_connector=True):
         self.reset_prefix_calls += 1
+        return True
 
 
 def _make_server(node_rank: int = 0, cls=vllm_async_server.vLLMHttpServer):
@@ -379,3 +381,17 @@ def test_output_hook_runs_for_requests_aborted_with_empty_outputs(monkeypatch):
         assert server._admitting == 0
 
     asyncio.run(main())
+
+
+def test_shared_store_prepares_without_deleting_before_manager_barrier():
+    server = _make_server()
+    server._shared_store_reset = True
+    server.abort_all_requests = AsyncMock()
+    server.engine.prepare_kv_cache_reset = AsyncMock()
+    server.clear_kv_cache = AsyncMock()
+    generation = asyncio.run(server.prepare_kv_cache_reset())
+    server.abort_all_requests.assert_awaited_once_with(reset_prefix_cache=False, require_admission_barrier=True)
+    server.engine.prepare_kv_cache_reset.assert_awaited_once()
+    server.clear_kv_cache.assert_not_awaited()
+    assert generation is not None
+    assert server._submission_paused
