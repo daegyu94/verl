@@ -198,41 +198,40 @@ class ReplayBuffer:
         if self.sync_refill_failed_groups and self.gen_batch_size != 1:
             raise ValueError("sync_refill_failed_groups requires gen_batch_size=1")
 
-    def _sync_metadata_from_transfer_queue(self):
-        """Sync the metadata from TransferQueue."""
-        self.partitions.clear()
-        self.pending_keys.clear()
-        self.running_keys.clear()
-        self.finished_keys.clear()
-        self.failure_keys.clear()
-        self.prompt_global_steps.clear()
-
-        data = tq.kv_list()
-        if data is None:
-            return
-
-        for partition_id, items in data.items():
-            partition = self.partitions[partition_id]
+    def _sync_metadata_from_transfer_queue(self, partition_id: str | None = None):
+        """Replace queried snapshots; preserve other partitions and failed polls."""
+        data = (tq.kv_list() if partition_id is None else tq.kv_list(partition_id=partition_id)) or {}
+        queried = data.items() if partition_id is None else [(partition_id, data.get(partition_id, {}))]
+        snapshots = {}
+        for pid, items in queried:
+            partition, prompt_global_steps = {}, {}
+            statuses = {status: set() for status in ("pending", "running", "finished", "failure")}
             for key, tag in items.items():
                 if tag.get("is_prompt", False):
                     # see: [GRPO group sampling control]
-                    self.prompt_global_steps[partition_id][key] = tag["global_steps"]
-                    match tag["status"]:
-                        case "pending":
-                            self.pending_keys[partition_id].add(key)
-                        case "running":
-                            self.running_keys[partition_id].add(key)
-                        case "finished":
-                            self.finished_keys[partition_id].add(key)
-                        case "failure":
-                            self.failure_keys[partition_id].add(key)
-                        case _:
-                            raise ValueError(f"Unknown status: {tag['status']}")
+                    prompt_global_steps[key] = tag["global_steps"]
+                    if tag["status"] not in statuses:
+                        raise ValueError(f"Unknown status: {tag['status']}")
+                    statuses[tag["status"]].add(key)
                 else:
                     # see: [Trajectories storage format]
-                    if key not in partition:
-                        partition[key] = {}
-                    partition[key].update(tag)
+                    partition[key] = dict(tag)
+            snapshots[pid] = (partition, *statuses.values(), prompt_global_steps)
+
+        caches = (
+            self.partitions,
+            self.pending_keys,
+            self.running_keys,
+            self.finished_keys,
+            self.failure_keys,
+            self.prompt_global_steps,
+        )
+        if partition_id is None:
+            for cache in caches:
+                cache.clear()
+        for pid, values in snapshots.items():
+            for cache, value in zip(caches, values, strict=True):
+                cache[pid] = value
 
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:
@@ -448,7 +447,7 @@ class ReplayBuffer:
 
         while True:
             # Eviction, gating, and selection below must all use this snapshot.
-            self._sync_metadata_from_transfer_queue()
+            self._sync_metadata_from_transfer_queue(partition_id)
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             failed_count = len(eviction_reasons[2])
@@ -557,7 +556,7 @@ class ReplayBufferAsync(ReplayBuffer):
 
     def get_sampleable_count(self, global_steps: int, partition_id: str) -> int:
         """Return the current number of terminal groups eligible for sampling."""
-        self._sync_metadata_from_transfer_queue()
+        self._sync_metadata_from_transfer_queue(partition_id)
         eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
         return len(self._sampleable_terminal_keys(partition_id, eviction_reasons))
 
@@ -571,7 +570,7 @@ class ReplayBufferAsync(ReplayBuffer):
 
         while True:
             # Eviction and selection share one snapshot so newly terminal stale groups wait for the next eviction pass.
-            self._sync_metadata_from_transfer_queue()
+            self._sync_metadata_from_transfer_queue(partition_id)
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             evicted_uids, stale_count, _dapo_count, metrics = self._evict_terminal_groups(

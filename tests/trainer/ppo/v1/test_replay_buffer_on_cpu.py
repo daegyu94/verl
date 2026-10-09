@@ -19,14 +19,17 @@ versions as ``global_steps - prompt_global_steps + 1``; ``drop`` and ``wait`` ap
 trainers.
 """
 
+import copy
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 
 import pytest
+import ray
 import torch
 import transfer_queue as tq
+from omegaconf import OmegaConf
 from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
@@ -35,11 +38,133 @@ from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 POLL_INTERVAL = 0.05
 
 
+def _metadata_snapshot():
+    return {
+        "train": {
+            "t": {"is_prompt": True, "status": "finished", "global_steps": 2},
+            "t_0_0": {"seq_len": 3, "global_steps": 2},
+        },
+        "val": {
+            "v": {"is_prompt": True, "status": "pending", "global_steps": 1},
+            "v_0_0": {"seq_len": 7, "global_steps": 1},
+        },
+    }
+
+
+def _snapshot_state(rb, partition):
+    return tuple(
+        copy.deepcopy(getattr(rb, name).get(partition, {}))
+        for name in (
+            "partitions",
+            "pending_keys",
+            "running_keys",
+            "finished_keys",
+            "failure_keys",
+            "prompt_global_steps",
+        )
+    )
+
+
+def test_target_poll_preserves_unqueried_partition_snapshot(monkeypatch):
+    data = _metadata_snapshot()
+    requests = []
+
+    def list_metadata(partition_id=None):
+        requests.append(partition_id)
+        return copy.deepcopy(data if partition_id is None else {partition_id: data.get(partition_id, {})})
+
+    monkeypatch.setattr(tq, "kv_list", list_metadata)
+    rb = _make_rb(trainer_mode="colocate_async")
+    rb._sync_metadata_from_transfer_queue()
+    before = _snapshot_state(rb, "val")
+    data["val"]["v"]["status"] = "finished"
+    assert rb.get_sampleable_count(global_steps=2, partition_id="train") == 1
+    assert requests[-1] == "train"
+    assert _snapshot_state(rb, "val") == before
+    assert rb.get_sampleable_count(global_steps=2, partition_id="val") == 1
+    assert rb.finished_keys["val"] == {"v"}
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+def test_sampling_ignores_malformed_foreign_partition(monkeypatch, mode):
+    data = _metadata_snapshot()
+    data["val"]["v"]["status"] = "bad-foreign-status"
+    monkeypatch.setattr(
+        tq,
+        "kv_list",
+        lambda partition_id=None: copy.deepcopy(
+            data if partition_id is None else {partition_id: data.get(partition_id, {})}
+        ),
+    )
+    monkeypatch.setattr(tq, "kv_clear", lambda **kwargs: None)
+    rb = _make_rb(trainer_mode=mode)
+    batch, metrics = rb.sample(global_steps=2, partition_id="train", batch_size=1)
+    assert batch.keys == ["t_0_0"]
+    assert metrics == {}
+    assert "val" not in rb.partitions
+
+
+def test_failed_poll_preserves_cached_metadata(monkeypatch):
+    data = _metadata_snapshot()
+    monkeypatch.setattr(tq, "kv_list", lambda partition_id=None: copy.deepcopy(data))
+    rb = _make_rb(trainer_mode="colocate_async")
+    rb._sync_metadata_from_transfer_queue()
+    before = _snapshot_state(rb, "train"), _snapshot_state(rb, "val")
+
+    def failed(partition_id=None):
+        raise TimeoutError("metadata RPC timeout")
+
+    monkeypatch.setattr(tq, "kv_list", failed)
+    with pytest.raises(TimeoutError):
+        rb.get_sampleable_count(global_steps=2, partition_id="train")
+    assert (_snapshot_state(rb, "train"), _snapshot_state(rb, "val")) == before
+
+
+@pytest.mark.parametrize("reply", [None, {}, {"train": {}}])
+def test_absent_partition_clears_only_its_snapshot(monkeypatch, reply):
+    monkeypatch.setattr(tq, "kv_list", lambda partition_id=None: _metadata_snapshot())
+    rb = _make_rb(trainer_mode="colocate_async")
+    rb._sync_metadata_from_transfer_queue()
+    val_before = _snapshot_state(rb, "val")
+    monkeypatch.setattr(tq, "kv_list", lambda partition_id=None: reply)
+    assert rb.get_sampleable_count(global_steps=2, partition_id="train") == 0
+    assert rb.partitions["train"] == {} and rb.finished_keys["train"] == set()
+    assert _snapshot_state(rb, "val") == val_before
+
+
+def test_invalid_target_tag_does_not_publish_partial_state(monkeypatch):
+    data = _metadata_snapshot()
+    monkeypatch.setattr(tq, "kv_list", lambda partition_id=None: copy.deepcopy(data))
+    rb = _make_rb(trainer_mode="colocate_async")
+    rb._sync_metadata_from_transfer_queue()
+    before = _snapshot_state(rb, "train")
+    data["train"]["t"]["status"] = "invalid"
+    with pytest.raises(ValueError, match="Unknown status"):
+        rb.get_sampleable_count(global_steps=2, partition_id="train")
+    assert _snapshot_state(rb, "train") == before
+
+
 @pytest.fixture(scope="module")
 def tq_init():
-    tq.init()
-    yield
-    tq.close()
+    own_ray = not ray.is_initialized()
+    if own_ray:
+        ray.init(address="local", num_cpus=2, include_dashboard=False, object_store_memory=128 * 1024**2)
+    try:
+        tq.init(
+            OmegaConf.create(
+                {
+                    "backend": {
+                        "storage_backend": "SimpleStorage",
+                        "SimpleStorage": {"num_data_storage_units": 1, "total_storage_size": 10000},
+                    }
+                }
+            )
+        )
+        yield
+    finally:
+        tq.close()
+        if own_ray:
+            ray.shutdown()
 
 
 @pytest.fixture
