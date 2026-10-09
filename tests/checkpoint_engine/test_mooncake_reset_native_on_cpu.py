@@ -45,6 +45,9 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
     if not all(binaries):
         pytest.skip("Set the CPU Master and pending-PUT helper binary paths")
     from mooncake.store import MooncakeDistributedStore
+
+    monkeypatch.setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", str(1024 * 1024))
+    monkeypatch.setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "0")
     from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker as worker_module
