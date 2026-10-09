@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import os
 import random
 import shutil
+import stat
+import tempfile
 
 import numpy as np
 import torch
@@ -257,6 +260,39 @@ def get_checkpoint_tracker_filename(root_path: str):
     Tracker file rescords the latest chckpoint during training to restart from.
     """
     return os.path.join(root_path, "latest_checkpointed_iteration.txt")
+
+
+def write_checkpoint_tracker(root_path: str, iteration: int) -> None:
+    """Publish a complete local tracker after checkpoint contents are saved.
+
+    Failures before replacement leave the old tracker intact. A directory
+    fsync failure after replacement can leave the new tracker visible.
+    """
+    tracker = get_checkpoint_tracker_filename(root_path)
+    temporary = None
+    directory_fd = os.open(root_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        try:
+            mode = stat.S_IMODE(os.stat(tracker).st_mode)
+        except FileNotFoundError:
+            mode = None
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=root_path, prefix=".latest_checkpointed_iteration.", delete=False
+        ) as file:
+            temporary = file.name
+            if mode is not None:
+                os.fchmod(file.fileno(), mode)
+            value = str(iteration)
+            if file.write(value) != len(value):
+                raise OSError(errno.EIO, "Incomplete checkpoint tracker write")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, tracker)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def should_save_ckpt_esi(max_steps_duration: float, save_ckpt_duration: float = 60, redundant_time: float = 0) -> bool:

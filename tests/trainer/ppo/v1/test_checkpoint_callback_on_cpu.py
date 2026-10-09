@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import builtins
+import errno
 import os
+import tempfile
 from unittest.mock import MagicMock
 
 import pytest
@@ -80,6 +83,58 @@ def test_save_fires_on_save_after_worker_save(tmp_path):
     tracker = os.path.join(str(tmp_path), "latest_checkpointed_iteration.txt")
     with open(tracker) as f:
         assert f.read() == "3"
+
+
+@pytest.mark.parametrize("fault", ["partial_write", "file_fsync", "replace"])
+def test_tracker_publication_failure_preserves_previous_complete_step(tmp_path, monkeypatch, fault):
+    events = []
+    trainer = _make_trainer(tmp_path, events)
+    trainer.global_steps = 345  # A partial write must not publish the prefix "3".
+    tracker = tmp_path / "latest_checkpointed_iteration.txt"
+    tracker.write_text("2")
+    (tmp_path / "global_step_2").mkdir()
+
+    class InterruptedWriter:
+        def __init__(self, file):
+            self.file = file
+
+        def __getattr__(self, name):
+            return getattr(self.file, name)
+
+        def __enter__(self):
+            self.file.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.file.__exit__(*args)
+
+        def write(self, value):
+            self.file.write(value[:1])
+            self.file.flush()
+            raise OSError(errno.EIO, "tracker write interrupted")
+
+    if fault == "partial_write":
+        original_open, original_temp = builtins.open, tempfile.NamedTemporaryFile
+
+        def interrupted_open(path, mode="r", *args, **kwargs):
+            file = original_open(path, mode, *args, **kwargs)
+            return InterruptedWriter(file) if str(path) == str(tracker) and "w" in mode else file
+
+        monkeypatch.setattr(builtins, "open", interrupted_open)
+        monkeypatch.setattr(
+            tempfile, "NamedTemporaryFile", lambda *args, **kwargs: InterruptedWriter(original_temp(*args, **kwargs))
+        )
+    else:
+
+        def fail(*args, **kwargs):
+            raise OSError(errno.EIO, "tracker publication interrupted")
+
+        monkeypatch.setattr(os, "fsync" if fault == "file_fsync" else "replace", fail)
+    with pytest.raises(OSError, match="interrupted"):
+        trainer._save_checkpoint()
+    assert tracker.read_text() == "2"
+    assert not any(event[0] == "on_save" for event in events)
+    assert not list(tmp_path.glob(".latest_checkpointed_iteration.*"))
 
 
 def test_async_save_fires_on_save_with_flag(tmp_path):

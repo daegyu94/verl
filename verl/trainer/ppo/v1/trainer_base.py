@@ -74,7 +74,7 @@ from verl.trainer.ppo.utils import (
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
 from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
 from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, write_checkpoint_tracker
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
@@ -1018,11 +1018,7 @@ class PPOTrainer(ABC):
                 async_save=True,
             )
             return
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
+        write_checkpoint_tracker(self.config.trainer.default_local_dir, self.global_steps)
 
         self.checkpoint_callback.on_save(
             trainer=self, global_step=self.global_steps, checkpoint_dir=local_global_step_folder, async_save=False

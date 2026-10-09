@@ -60,7 +60,11 @@ from verl.trainer.ppo.utils import (
     need_teacher_policy,
 )
 from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    should_save_ckpt_esi,
+    write_checkpoint_tracker,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
@@ -1043,11 +1047,7 @@ class RayPPOTrainer:
         ):
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
+        write_checkpoint_tracker(self.config.trainer.default_local_dir, self.global_steps)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
