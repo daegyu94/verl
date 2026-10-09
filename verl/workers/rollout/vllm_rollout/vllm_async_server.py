@@ -293,6 +293,10 @@ class vLLMHttpServer:
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
+        from verl.workers.rollout.mooncake_reset_identity import mooncake_reset_key
+
+        self._shared_store_reset_key = mooncake_reset_key(engine_kwargs)
+
         from verl.workers.rollout.shared_kv_reset import uses_shared_mooncake_store
 
         self._shared_store_reset = uses_shared_mooncake_store(engine_kwargs)
@@ -868,7 +872,7 @@ class vLLMHttpServer:
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
-            await self._reset_prefix_cache()
+            await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
@@ -876,7 +880,7 @@ class vLLMHttpServer:
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
             # is configured (vLLM scheduler treats it as such).
-            await self._reset_prefix_cache()
+            await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
@@ -917,13 +921,19 @@ class vLLMHttpServer:
             await self.abort_all_requests()
         return None
 
-    async def complete_kv_cache_reset(self, reset_generation: str | None = None):
+    async def complete_kv_cache_reset(self, reset_generation: str | None = None, reset_store: bool | None = None):
         if getattr(self, "_shared_store_reset", False):
             self._check_kv_reset_generation(reset_generation)
-            if not callable(getattr(self, "_reset_prefix_cache", None)):
-                raise RuntimeError("Shared reset completion requires the checked reset ACK API")
-            await self.clear_kv_cache()
+            if self.node_rank == 0:
+                if reset_store is None:
+                    await self.clear_kv_cache()
+                else:
+                    if not await self.engine.reset_shared_prefix_cache(reset_store=reset_store):
+                        raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
+                    await self.engine.reset_mm_cache()
+                    await self.engine.reset_encoder_cache()
             self._check_kv_reset_generation(reset_generation)
+            self._kv_reset_completed_generation = reset_generation
 
     async def resume_kv_cache_reset(self, resume_generation: bool = False, reset_generation: str | None = None):
         if getattr(self, "_shared_store_reset", False) or resume_generation:
@@ -944,13 +954,25 @@ class vLLMHttpServer:
             self._submission_paused = True
             self._resume_event.clear()
 
+    def _shared_reset_acknowledged(self) -> bool:
+        generation = getattr(self, "_kv_reset_completed_generation", None)
+        return bool(
+            getattr(self, "_shared_store_reset", False)
+            and self._submission_paused
+            and generation is not None
+            and generation == getattr(self, "_kv_reset_generation", None)
+        )
+
+    async def get_kv_cache_reset_key(self):
+        return getattr(self, "_shared_store_reset_key", None) if self.node_rank == 0 else None
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous model weights. With no connector it
             # is a no-op success, so we can pass it unconditionally.
-            await self._reset_prefix_cache()
+            await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
 
             await self.engine.reset_mm_cache()
             await self.engine.reset_encoder_cache()
@@ -962,7 +984,10 @@ class vLLMHttpServer:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        await self.engine.sleep(level=self._resolve_sleep_level())
+        if self._shared_reset_acknowledged() and getattr(self, "_shared_store_reset_key", None) is not None:
+            await self.engine.sleep_after_shared_cache_reset(level=self._resolve_sleep_level())
+        else:
+            await self.engine.sleep(level=self._resolve_sleep_level())
         await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
@@ -972,7 +997,7 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
         await self.engine.wake_up(tags=["kv_cache"])
-        await self._reset_prefix_cache()
+        await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
 
     async def snapshot(self) -> dict[str, Any]:
         """Return live KV-cache and scheduler queue observations.
@@ -1532,6 +1557,9 @@ class vLLMHttpServer:
 
 
 class vLLMReplica(RolloutReplica):
+    async def get_kv_cache_reset_key(self):
+        return await self.servers[0].get_kv_cache_reset_key.remote()
+
     async def fence_kv_cache_reset(self):
         await self._reset_phase("fence_kv_cache_reset")
 
@@ -1541,8 +1569,8 @@ class vLLMReplica(RolloutReplica):
     async def resume_kv_cache_reset(self, resume_generation: bool = False):
         await self._reset_phase("resume_kv_cache_reset", resume_generation=resume_generation)
 
-    async def complete_kv_cache_reset(self):
-        await self._reset_phase("complete_kv_cache_reset")
+    async def complete_kv_cache_reset(self, reset_store: bool | None = None):
+        await self._reset_phase("complete_kv_cache_reset", reset_store=reset_store)
 
     async def prepare_kv_cache_reset(self, abort_requests: bool = True):
         self._kv_reset_generations = None

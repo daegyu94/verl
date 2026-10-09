@@ -302,6 +302,9 @@ class RolloutReplica(ABC):
     async def fence_kv_cache_reset(self):
         return None
 
+    async def get_kv_cache_reset_key(self):
+        return None
+
     async def clear_kv_cache(self):
         """reset kv cache in each rollout server."""
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])

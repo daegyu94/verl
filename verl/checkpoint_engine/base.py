@@ -527,6 +527,22 @@ class CheckpointEngineManager:
                 logging.getLogger(__name__).exception("Failed to re-fence shared KV admission after resume failure")
             raise
 
+    async def _complete_cache_reset(self):
+        keys = await asyncio.gather(*[replica.get_kv_cache_reset_key() for replica in self.replicas])
+        seen = set()
+        completions = []
+        for replica, key in zip(self.replicas, keys, strict=True):
+            if key is None:
+                completions.append(replica.complete_kv_cache_reset())
+            else:
+                key = tuple(key)
+                completions.append(replica.complete_kv_cache_reset(reset_store=key not in seen))
+                seen.add(key)
+        results = await asyncio.gather(*completions, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
     @auto_await
     async def update_weights(self, global_steps: int = None):
         """Update weights from actor worker group to rollout replicas.
