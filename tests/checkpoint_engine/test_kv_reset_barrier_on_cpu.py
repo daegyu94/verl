@@ -9,6 +9,7 @@ import pytest
 
 from tests.workers.rollout.rollout_vllm.test_submitter_gate_on_cpu import _make_server
 from verl.checkpoint_engine import base
+from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 
@@ -26,9 +27,107 @@ def _shared_replica(server):
         "resume_kv_cache_reset",
         "finish_kv_cache_reset",
         "fence_kv_cache_reset",
+        "get_kv_cache_reset_key",
     )
     replica.servers = [SimpleNamespace(**{name: SimpleNamespace(remote=getattr(server, name)) for name in phases})]
     return replica
+
+
+@pytest.mark.parametrize("same_store", [False, True])
+@pytest.mark.parametrize("fail_delete", [False, True])
+def test_shared_store_deleted_once_after_all_replicas_prepare(monkeypatch, same_store, fail_delete):
+    async def run():
+        servers = [_make_server(), _make_server()]
+        replicas = [_shared_replica(server) for server in servers]
+        prepared, cleared, deletes = set(), set(), []
+        entered, release = asyncio.Event(), asyncio.Event()
+        for rank, (server, replica) in enumerate(zip(servers, replicas, strict=True)):
+            replica.get_kv_cache_reset_key = AsyncMock(
+                return_value=("master", "tenant", "policy" if same_store else str(rank))
+            )
+
+            async def prepare(rank=rank):
+                if rank == 1:
+                    entered.set()
+                    await release.wait()
+                prepared.add(rank)
+
+            async def reset(reset_connector=True, rank=rank):
+                assert prepared == {0, 1}
+                assert all(server._submission_paused for server in servers)
+                if reset_connector:
+                    deletes.append(rank)
+                    if fail_delete and rank == 0:
+                        return False
+                cleared.add(rank)
+                return True
+
+            server.engine.prepare_kv_cache_reset = prepare
+            server.engine.reset_prefix_cache = reset
+            server.engine.reset_shared_prefix_cache = lambda reset_store, reset=reset: reset(
+                reset_connector=reset_store
+            )
+        manager = base.CheckpointEngineManager.__new__(base.CheckpointEngineManager)
+        manager.backend, manager.replicas = "naive", replicas
+        weights = []
+
+        def update(**kwargs):
+            assert cleared == {0, 1}
+            assert deletes == ([0] if same_store else [0, 1])
+            weights.append("new")
+            return []
+
+        manager.actor_wg = SimpleNamespace(update_weights=update)
+        monkeypatch.setattr(base.ray, "get", lambda values: values)
+        task = asyncio.create_task(manager.update_weights(global_steps=8))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not deletes and not weights
+        release.set()
+        if fail_delete:
+            with pytest.raises(RuntimeError, match="failed to reset"):
+                await task
+            assert not weights
+            assert all(server._submission_paused for server in servers)
+        else:
+            await task
+            assert weights == ["new"]
+            assert all(not server._submission_paused for server in servers)
+
+    asyncio.run(run())
+
+
+def test_weight_receiver_and_kv_restore_do_not_repeat_acknowledged_store_reset():
+    async def run():
+        server = _make_server()
+        server._shared_store_reset = True
+        server.rollout_mode = RolloutMode.HYBRID
+        server.config = SimpleNamespace(free_cache_engine=True)
+        server._shared_store_reset_key = ("master", "default", "policy")
+        server._resolve_sleep_level = lambda: 1
+        server.engine.prepare_kv_cache_reset = AsyncMock()
+        server.engine.reset_shared_prefix_cache = AsyncMock(return_value=True)
+        server.engine.reset_prefix_cache = AsyncMock(return_value=True)
+        server.engine.reset_mm_cache = AsyncMock()
+        server.engine.reset_encoder_cache = AsyncMock()
+        server.engine.wake_up = AsyncMock()
+        server.engine.sleep_after_shared_cache_reset = AsyncMock()
+        server.engine.sleep = AsyncMock()
+        generation = await server.prepare_kv_cache_reset()
+        await server.complete_kv_cache_reset(reset_generation=generation, reset_store=True)
+        await server.clear_kv_cache()  # ServerAdapter after receiving weights
+        await server.release_kv_cache()  # sleep normally resets the external store
+        server.engine.sleep.assert_not_awaited()
+        server.engine.sleep_after_shared_cache_reset.assert_awaited_once_with(level=1)
+        await server.resume_kv_cache()  # non-naive checkpoint restore
+        assert server._submission_paused
+        assert all(
+            call.kwargs == {"reset_connector": False} for call in server.engine.reset_prefix_cache.await_args_list
+        )
+        await server.fence_kv_cache_reset(reset_generation=generation)
+        await server.clear_kv_cache()
+        assert server.engine.reset_prefix_cache.await_args.kwargs == {"reset_connector": True}
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("failure_phase", ["release", "group", "finalize", "restore"])
@@ -277,7 +376,7 @@ def test_actual_shared_reset_protocol_fences_every_failure(monkeypatch, backend,
             replica = vLLMReplica.__new__(vLLMReplica)
             replica.workers = []
             phases = ["prepare_kv_cache_reset", "complete_kv_cache_reset", "finish_kv_cache_reset"]
-            phases += ["resume_kv_cache_reset", "fence_kv_cache_reset"]
+            phases += ["resume_kv_cache_reset", "fence_kv_cache_reset", "get_kv_cache_reset_key"]
             replica.servers = [
                 SimpleNamespace(**{name: SimpleNamespace(remote=getattr(server, name)) for name in phases})
             ]
@@ -419,6 +518,9 @@ def test_weight_update_waits_for_all_replicas_and_stays_fenced_on_failure(monkey
                 if failure_phase == "prepare" and self.rank == 0:
                     raise RuntimeError("prepare failed")
                 prepared.add(self.rank)
+
+            async def get_kv_cache_reset_key(self):
+                return None
 
             async def complete_kv_cache_reset(self):
                 assert prepared == {0, 1}

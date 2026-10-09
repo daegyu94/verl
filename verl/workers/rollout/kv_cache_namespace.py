@@ -42,6 +42,22 @@ def uses_mooncake_store(engine_kwargs) -> bool:
     return bool(transfer and any(_store_connectors(transfer)))
 
 
+def mooncake_reset_key(engine_kwargs) -> tuple[str, str, str] | None:
+    """Identify a single Store using the same config loader as its vLLM workers."""
+    transfer = _transfer_config(engine_kwargs)
+    if not transfer or transfer.get("kv_connector") != "MooncakeStoreConnector":
+        return None
+    from vllm.distributed.mooncake_store import MooncakeStoreConfig
+
+    config = MooncakeStoreConfig.load_from_config()
+    if not config.master_server_address:
+        return None
+    prefix = transfer.get("kv_connector_extra_config", {}).get("cache_prefix")
+    if not isinstance(prefix, str) or not prefix or "@" in prefix:
+        raise ValueError("Coordinated Mooncake reset requires an isolated cache_prefix")
+    return config.master_server_address, config.tenant_id, prefix
+
+
 def validate_mooncake_cache_namespaces(engine_kwargs) -> None:
     """Reject a Store configuration without an isolated prefix at server startup."""
     transfer = _transfer_config(engine_kwargs)

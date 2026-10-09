@@ -53,6 +53,7 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
     from vllm.v1.engine.core import EngineCore
+    from vllm.v1.engine.core_client import AsyncMPClient
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
     from vllm.v1.metrics.stats import PrefixCacheStats
     from vllm.v1.structured_output import StructuredOutputManager
@@ -213,6 +214,14 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
                 async def reset_prefix_cache(self, reset_connector):
                     return await self.call(self.core.reset_prefix_cache, reset_connector=reset_connector)
 
+                async def reset_shared_prefix_cache(self, reset_store):
+                    client = AsyncMPClient.__new__(AsyncMPClient)
+                    client.core_engines = [b"cpu-engine"]
+                    client._call_utility_async = lambda method, *args, engine: self.call(
+                        getattr(self.core, method), *args
+                    )
+                    return await client.reset_shared_prefix_cache_async(reset_store)
+
                 async def reset_mm_cache(self):
                     await self.call(self.core.reset_mm_cache)
 
@@ -244,6 +253,7 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
             for engine in engines:
                 server = _make_server()
                 server.engine, server._shared_store_reset = engine, True
+                server._shared_store_reset_key = (f"127.0.0.1:{rpc}", "default", prefix)
                 servers.append(server)
                 replica = vLLMReplica.__new__(vLLMReplica)
                 replica.workers = []
@@ -253,6 +263,7 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
                     "resume_kv_cache_reset",
                     "finish_kv_cache_reset",
                     "fence_kv_cache_reset",
+                    "get_kv_cache_reset_key",
                 )
                 replica.servers = [
                     SimpleNamespace(**{name: SimpleNamespace(remote=getattr(server, name)) for name in phases})
@@ -278,7 +289,11 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
 
             # Retry after assigning the outstanding native PUT to the late worker.
             pending_queue.put(pending_key)
-            engines[1].worker.kv_send_thread = SimpleNamespace(request_queue=pending_queue)
+            sender = worker_module.KVCacheStoreSendingThread(
+                stores[1], None, [], 16, 0, [], "kv_both", threading.Event()
+            )
+            sender.request_queue = pending_queue
+            engines[1].worker.kv_send_thread = sender
             for engine in engines:
                 engine.started.clear()
             update = asyncio.create_task(manager.update_weights(global_steps=8))
@@ -298,6 +313,7 @@ def test_native_pending_put_reset_barrier_and_gate_retry(monkeypatch, tmp_path):
             assert stores[0].get(foreign) == b"foreign-policy-KV"
             await manager.update_weights(global_steps=8)  # verified empty/reset retry
             assert outcome["weights"] == 2
+            assert outcome["reset_results"] == [-703, 1, 0]
             outcome["foreign_preserved"] = True
 
         asyncio.run(run())

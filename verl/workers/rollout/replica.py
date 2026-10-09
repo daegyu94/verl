@@ -288,6 +288,10 @@ class RolloutReplica(ABC):
     async def complete_kv_cache_reset(self):
         return None
 
+    async def get_kv_cache_reset_key(self):
+        """Return a shared namespace identity, or None to retain backend behavior."""
+        return None
+
     async def resume_kv_cache_reset(self, resume_generation: bool = False):
         if resume_generation:
             await self.resume_generation()

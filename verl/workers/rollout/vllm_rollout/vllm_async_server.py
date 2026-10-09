@@ -299,9 +299,10 @@ class vLLMHttpServer:
         from verl.workers.rollout.kv_cache_namespace import validate_mooncake_cache_namespaces
 
         validate_mooncake_cache_namespaces(engine_kwargs)
-        from verl.workers.rollout.kv_cache_namespace import uses_mooncake_store
+        from verl.workers.rollout.kv_cache_namespace import mooncake_reset_key, uses_mooncake_store
 
         self._shared_store_reset = uses_mooncake_store(engine_kwargs)
+        self._shared_store_reset_key = mooncake_reset_key(engine_kwargs)
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -897,9 +898,23 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
-    async def _reset_prefix_cache(self):
-        if not await self.engine.reset_prefix_cache(reset_connector=True):
+    def _shared_reset_acknowledged(self) -> bool:
+        generation = getattr(self, "_kv_reset_completed_generation", None)
+        return bool(
+            getattr(self, "_shared_store_reset", False)
+            and self._submission_paused
+            and generation is not None
+            and generation == getattr(self, "_kv_reset_generation", None)
+        )
+
+    async def _reset_prefix_cache(self, reset_connector: bool | None = None):
+        if reset_connector is None:
+            reset_connector = not self._shared_reset_acknowledged()
+        if not await self.engine.reset_prefix_cache(reset_connector=reset_connector):
             raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
+
+    async def get_kv_cache_reset_key(self):
+        return getattr(self, "_shared_store_reset_key", None) if self.node_rank == 0 else None
 
     def _check_kv_reset_generation(self, reset_generation: str | None):
         if getattr(self, "_shared_store_reset", False) and (
@@ -911,6 +926,7 @@ class vLLMHttpServer:
         if getattr(self, "_shared_store_reset", False):
             generation = uuid.uuid4().hex
             self._kv_reset_generation = generation
+            self._kv_reset_completed_generation = None
             self._kv_reset_participated = True
             self._submission_paused = True
             self._resume_event.clear()
@@ -923,11 +939,19 @@ class vLLMHttpServer:
             await self.abort_all_requests()
         return None
 
-    async def complete_kv_cache_reset(self, reset_generation: str | None = None):
+    async def complete_kv_cache_reset(self, reset_generation: str | None = None, reset_store: bool | None = None):
         if getattr(self, "_shared_store_reset", False):
             self._check_kv_reset_generation(reset_generation)
-            await self.clear_kv_cache()
+            if self.node_rank == 0:
+                if reset_store is None:
+                    await self.clear_kv_cache()
+                else:
+                    if not await self.engine.reset_shared_prefix_cache(reset_store=reset_store):
+                        raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
+                    await self.engine.reset_mm_cache()
+                    await self.engine.reset_encoder_cache()
             self._check_kv_reset_generation(reset_generation)
+            self._kv_reset_completed_generation = reset_generation
 
     async def resume_kv_cache_reset(self, resume_generation: bool = False, reset_generation: str | None = None):
         if getattr(self, "_shared_store_reset", False) or resume_generation:
@@ -966,7 +990,10 @@ class vLLMHttpServer:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        await self.engine.sleep(level=self._resolve_sleep_level())
+        if self._shared_reset_acknowledged() and getattr(self, "_shared_store_reset_key", None) is not None:
+            await self.engine.sleep_after_shared_cache_reset(level=self._resolve_sleep_level())
+        else:
+            await self.engine.sleep(level=self._resolve_sleep_level())
         await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
@@ -1561,8 +1588,11 @@ class vLLMReplica(RolloutReplica):
         self._kv_reset_generations = None
         self._kv_reset_generations = await self._reset_phase("prepare_kv_cache_reset", abort_requests=abort_requests)
 
-    async def complete_kv_cache_reset(self):
-        await self._reset_phase("complete_kv_cache_reset")
+    async def get_kv_cache_reset_key(self):
+        return await self.servers[0].get_kv_cache_reset_key.remote()
+
+    async def complete_kv_cache_reset(self, reset_store: bool | None = None):
+        await self._reset_phase("complete_kv_cache_reset", reset_store=reset_store)
 
     async def resume_kv_cache_reset(self, resume_generation: bool = False):
         await self._reset_phase("resume_kv_cache_reset", resume_generation=resume_generation)

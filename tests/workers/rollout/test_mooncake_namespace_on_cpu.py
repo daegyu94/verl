@@ -20,6 +20,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.workers.rollout.kv_cache_namespace import (
+    mooncake_reset_key,
     prepare_mooncake_cache_namespaces,
     validate_mooncake_cache_namespaces,
 )
@@ -27,6 +28,22 @@ from verl.workers.rollout.kv_cache_namespace import (
 
 def _store(**extra):
     return {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_both", "kv_connector_extra_config": extra}
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_reset_identity_matches_native_worker_config(monkeypatch, tmp_path, as_json):
+    config_path = tmp_path / "mooncake.json"
+    config_path.write_text(json.dumps({"master_server_address": "master-a:50051", "tenant_id": "tenant-a"}))
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(config_path))
+    transfer = _store(cache_prefix="policy", mooncake_config_path="ignored-by-native-worker.json")
+    kwargs = {"kv_transfer_config": json.dumps(transfer) if as_json else transfer}
+    assert mooncake_reset_key(kwargs) == ("master-a:50051", "tenant-a", "policy")
+    config_path.write_text(json.dumps({"master_server_address": "master-b:50051", "tenant_id": "tenant-b"}))
+    assert mooncake_reset_key(kwargs) == ("master-b:50051", "tenant-b", "policy")
+    transfer["kv_connector_extra_config"]["cache_prefix"] = "other-policy"
+    assert mooncake_reset_key({"kv_transfer_config": transfer})[-1] == "other-policy"
+    # Composite reset may involve another connector's store; retain its contract.
+    assert mooncake_reset_key({"kv_transfer_config": {"kv_connector": "MultiConnector"}}) is None
 
 
 def _config(transfer=None):
