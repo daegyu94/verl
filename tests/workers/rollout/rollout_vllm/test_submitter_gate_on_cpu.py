@@ -451,3 +451,16 @@ def test_cache_reset_failure_prevents_weight_step_publication():
     adapter.server_handle.set_global_steps.remote.assert_not_awaited()
     assert events == ["receive"]
     server.engine.reset_prefix_cache.assert_awaited_once_with(reset_connector=True)
+
+def test_shared_store_prepares_without_deleting_before_manager_barrier():
+    server = _make_server()
+    server._shared_store_reset = True
+    server.abort_all_requests = AsyncMock()
+    server.engine.prepare_kv_cache_reset = AsyncMock()
+    server.clear_kv_cache = AsyncMock()
+    generation = asyncio.run(server.prepare_kv_cache_reset())
+    server.abort_all_requests.assert_awaited_once_with(reset_prefix_cache=False, require_admission_barrier=True)
+    server.engine.prepare_kv_cache_reset.assert_awaited_once()
+    server.clear_kv_cache.assert_not_awaited()
+    assert generation is not None
+    assert server._submission_paused

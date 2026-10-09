@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -506,6 +507,26 @@ class CheckpointEngineManager:
         """
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
+    async def _cache_reset_phase(self, phase, **kwargs):
+        results = await asyncio.gather(
+            *[getattr(replica, phase)(**kwargs) for replica in self.replicas],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _resume_after_weight_update(self):
+        try:
+            await self._cache_reset_phase("resume_kv_cache_reset", resume_generation=self.backend != "naive")
+            await self._cache_reset_phase("finish_kv_cache_reset", resume_generation=self.backend != "naive")
+        except BaseException:
+            try:
+                await self._cache_reset_phase("fence_kv_cache_reset")
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to re-fence shared KV admission after resume failure")
+            raise
+
     @auto_await
     async def update_weights(self, global_steps: int = None):
         """Update weights from actor worker group to rollout replicas.
@@ -514,13 +535,20 @@ class CheckpointEngineManager:
             global_steps: The global steps of the actor worker group.
         """
 
+        await self._cache_reset_phase("prepare_kv_cache_reset", abort_requests=self.backend != "naive")
+        completion = getattr(self, "_complete_cache_reset", None)
+        if completion is None:
+            await self._cache_reset_phase("complete_kv_cache_reset")
+        else:
+            await completion()
+
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
+            await self._resume_after_weight_update()
             return {}
 
         # 1. abort and save all unfinished requests for partial rollout
-        await self.abort_replicas()
 
         # 2. create a temporay worker group for all replicas
         workers = []
@@ -557,7 +585,7 @@ class CheckpointEngineManager:
         await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
-        await self.resume_generation_replicas()
+        await self._resume_after_weight_update()
 
         return sync_metrics
 

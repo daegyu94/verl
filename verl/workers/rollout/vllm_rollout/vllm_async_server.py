@@ -293,6 +293,10 @@ class vLLMHttpServer:
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
+        from verl.workers.rollout.shared_kv_reset import uses_shared_mooncake_store
+
+        self._shared_store_reset = uses_shared_mooncake_store(engine_kwargs)
+
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
         override_generation_config = self._get_override_generation_config()
@@ -891,6 +895,55 @@ class vLLMHttpServer:
         if not await self.engine.reset_prefix_cache(reset_connector=reset_connector):
             raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
 
+    def _check_kv_reset_generation(self, reset_generation: str | None):
+        if getattr(self, "_shared_store_reset", False) and (
+            reset_generation is None or reset_generation != getattr(self, "_kv_reset_generation", None)
+        ):
+            raise RuntimeError("Stale or missing shared KV reset generation")
+
+    async def prepare_kv_cache_reset(self, abort_requests: bool = True):
+        if getattr(self, "_shared_store_reset", False):
+            generation = uuid.uuid4().hex
+            self._kv_reset_generation = generation
+            self._kv_reset_participated = True
+            self._submission_paused = True
+            self._resume_event.clear()
+            if self.node_rank == 0:
+                await self.abort_all_requests(reset_prefix_cache=False, require_admission_barrier=True)
+                await self.engine.prepare_kv_cache_reset()
+            self._check_kv_reset_generation(generation)
+            return generation
+        if self.node_rank == 0 and abort_requests:
+            await self.abort_all_requests()
+        return None
+
+    async def complete_kv_cache_reset(self, reset_generation: str | None = None):
+        if getattr(self, "_shared_store_reset", False):
+            self._check_kv_reset_generation(reset_generation)
+            if not callable(getattr(self, "_reset_prefix_cache", None)):
+                raise RuntimeError("Shared reset completion requires the checked reset ACK API")
+            await self.clear_kv_cache()
+            self._check_kv_reset_generation(reset_generation)
+
+    async def resume_kv_cache_reset(self, resume_generation: bool = False, reset_generation: str | None = None):
+        if getattr(self, "_shared_store_reset", False) or resume_generation:
+            self._check_kv_reset_generation(reset_generation)
+            await self.resume_engine_generation()
+            self._check_kv_reset_generation(reset_generation)
+
+    async def finish_kv_cache_reset(self, resume_generation: bool = False, reset_generation: str | None = None):
+        if getattr(self, "_shared_store_reset", False) or resume_generation:
+            await self.open_submission_gate(reset_generation=reset_generation)
+
+    async def fence_kv_cache_reset(self, reset_generation: str | None = None):
+        if getattr(self, "_shared_store_reset", False):
+            if reset_generation is not None and reset_generation != getattr(self, "_kv_reset_generation", None):
+                return
+            self._kv_reset_generation = None
+            self._kv_reset_participated = True
+            self._submission_paused = True
+            self._resume_event.clear()
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
@@ -1039,6 +1092,7 @@ class vLLMHttpServer:
         reset_prefix_cache: bool = True,
         reject_request: bool = False,
         abort_only: bool = False,
+        require_admission_barrier: bool = False,
     ) -> dict[str, Any]:
         """Abort in-flight requests, optionally pausing the replica.
 
@@ -1062,6 +1116,8 @@ class vLLMHttpServer:
                 plain pause (e.g. the one inside a weight sync) restores parking.
             abort_only: Cancel in-flight requests and leave admission open.
                 reset_prefix_cache and reject_request are ignored.
+            require_admission_barrier: Fail rather than proceed when admitted
+                requests do not reach the engine before the timeout.
 
         Returns:
             dict[str, Any]: Dictionary containing:
@@ -1092,6 +1148,9 @@ class vLLMHttpServer:
             return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
         try:
+            require_admission_barrier = require_admission_barrier or (
+                getattr(self, "_shared_store_reset", False) and reset_prefix_cache
+            )
             # Close the gate first, then let admissions already past it land, so the pause
             # below actually covers them. Closing the gate and declaring how late arrivals
             # are handled happen together, so no request can observe one without the other.
@@ -1101,6 +1160,10 @@ class vLLMHttpServer:
             deadline = time.monotonic() + _GATE_BARRIER_TIMEOUT_S
             while self._admitting > 0:
                 if time.monotonic() > deadline:
+                    if require_admission_barrier:
+                        raise TimeoutError(
+                            f"Submission admission barrier timed out with {self._admitting} admission(s) in flight"
+                        )
                     logger.warning(
                         "Submission gate barrier timed out with %d admission(s) in flight, proceeding",
                         self._admitting,
@@ -1140,16 +1203,18 @@ class vLLMHttpServer:
         if self.node_rank == 0:
             await self.engine.resume_generation()
 
-    async def open_submission_gate(self):
+    async def open_submission_gate(self, reset_generation: str | None = None):
         """Admit requests after the replica has finished resuming its engines."""
+        if getattr(self, "_kv_reset_participated", False):
+            self._check_kv_reset_generation(reset_generation)
         self._rejecting = False
         self._submission_paused = False
         self._resume_event.set()
 
-    async def resume_generation(self):
+    async def resume_generation(self, reset_generation: str | None = None):
         """Resume generation after abort_all_requests (pause_generation)."""
         await self.resume_engine_generation()
-        await self.open_submission_gate()
+        await self.open_submission_gate(reset_generation=reset_generation)
 
     async def _park_until_admitted(self, request_id: str) -> Optional[TokenOutput]:
         """Wait out a closed gate, or fail the request when the gate rejects late arrivals.
@@ -1467,6 +1532,43 @@ class vLLMHttpServer:
 
 
 class vLLMReplica(RolloutReplica):
+    async def fence_kv_cache_reset(self):
+        await self._reset_phase("fence_kv_cache_reset")
+
+    async def finish_kv_cache_reset(self, resume_generation: bool = False):
+        await self._reset_phase("finish_kv_cache_reset", resume_generation=resume_generation)
+
+    async def resume_kv_cache_reset(self, resume_generation: bool = False):
+        await self._reset_phase("resume_kv_cache_reset", resume_generation=resume_generation)
+
+    async def complete_kv_cache_reset(self):
+        await self._reset_phase("complete_kv_cache_reset")
+
+    async def prepare_kv_cache_reset(self, abort_requests: bool = True):
+        self._kv_reset_generations = None
+        self._kv_reset_generations = await self._reset_phase("prepare_kv_cache_reset", abort_requests=abort_requests)
+
+    async def _reset_phase(self, phase, **kwargs):
+        generations = getattr(self, "_kv_reset_generations", None)
+        results = await asyncio.gather(
+            *[
+                getattr(server, phase).remote(
+                    **kwargs,
+                    **(
+                        {"reset_generation": generations[i] if generations is not None else None}
+                        if phase != "prepare_kv_cache_reset"
+                        else {}
+                    ),
+                )
+                for i, server in enumerate(self.servers)
+            ],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
     def __init__(
         self,
         replica_rank: int,
