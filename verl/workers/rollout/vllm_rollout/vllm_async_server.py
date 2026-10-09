@@ -293,6 +293,10 @@ class vLLMHttpServer:
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
+        from verl.workers.rollout.mooncake_reset_identity import mooncake_reset_key
+
+        self._shared_store_reset_key = mooncake_reset_key(engine_kwargs)
+
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
         override_generation_config = self._get_override_generation_config()
@@ -864,7 +868,7 @@ class vLLMHttpServer:
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
             await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
@@ -872,7 +876,7 @@ class vLLMHttpServer:
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous weights. No-op success when no connector
             # is configured (vLLM scheduler treats it as such).
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
@@ -887,13 +891,39 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    def _shared_reset_acknowledged(self) -> bool:
+        generation = getattr(self, "_kv_reset_completed_generation", None)
+        return bool(
+            getattr(self, "_shared_store_reset", False)
+            and self._submission_paused
+            and generation is not None
+            and generation == getattr(self, "_kv_reset_generation", None)
+        )
+
+    async def get_kv_cache_reset_key(self):
+        return getattr(self, "_shared_store_reset_key", None) if self.node_rank == 0 else None
+
+    async def complete_kv_cache_reset(self, reset_generation: str | None = None, reset_store: bool | None = None):
+        if getattr(self, "_shared_store_reset", False):
+            self._check_kv_reset_generation(reset_generation)
+            if self.node_rank == 0:
+                if reset_store is None:
+                    await self.clear_kv_cache()
+                else:
+                    if not await self.engine.reset_shared_prefix_cache(reset_store=reset_store):
+                        raise RuntimeError("vLLM failed to reset the prefix or external KV cache")
+                    await self.engine.reset_mm_cache()
+                    await self.engine.reset_encoder_cache()
+            self._check_kv_reset_generation(reset_generation)
+            self._kv_reset_completed_generation = reset_generation
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
             # (e.g. MooncakeStoreConnector) whose entries were computed
             # against the previous model weights. With no connector it
             # is a no-op success, so we can pass it unconditionally.
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
 
             await self.engine.reset_mm_cache()
             await self.engine.reset_encoder_cache()
@@ -905,7 +935,10 @@ class vLLMHttpServer:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        await self.engine.sleep(level=self._resolve_sleep_level())
+        if self._shared_reset_acknowledged() and getattr(self, "_shared_store_reset_key", None) is not None:
+            await self.engine.sleep_after_shared_cache_reset(level=self._resolve_sleep_level())
+        else:
+            await self.engine.sleep(level=self._resolve_sleep_level())
         await self.engine.wake_up(tags=["weights"])
 
     async def resume_kv_cache(self):
@@ -915,7 +948,7 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
         await self.engine.wake_up(tags=["kv_cache"])
-        await self.engine.reset_prefix_cache(reset_connector=True)
+        await self._reset_prefix_cache(reset_connector=not self._shared_reset_acknowledged())
 
     async def snapshot(self) -> dict[str, Any]:
         """Return live KV-cache and scheduler queue observations.
@@ -1463,6 +1496,12 @@ class vLLMHttpServer:
 
 
 class vLLMReplica(RolloutReplica):
+    async def complete_kv_cache_reset(self, reset_store: bool | None = None):
+        await self._reset_phase("complete_kv_cache_reset", reset_store=reset_store)
+
+    async def get_kv_cache_reset_key(self):
+        return await self.servers[0].get_kv_cache_reset_key.remote()
+
     def __init__(
         self,
         replica_rank: int,
