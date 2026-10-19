@@ -1045,6 +1045,9 @@ class PPOTrainer(ABC):
         session_to_sample_idx: dict[str, int] = {}
         # To avoid failure sessions
         expected_acc_counts: dict[tuple[str, str], int] = {}
+        # Decoded texts are only consumed by the generation table and the JSONL dump.
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        need_texts = bool(val_data_dir) or self.config.trainer.log_val_generations != 0
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
@@ -1105,20 +1108,23 @@ class PPOTrainer(ABC):
                 {session_key: base_offset + j for j, (session_key, _) in enumerate(sorted_sessions)}
             )
 
-            text_data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["prompts", "responses"]
-            )
-            text_data["prompts"] = text_data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
-            text_data["responses"] = text_data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
-            all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
-            all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
+            if need_texts:
+                text_data = tq.kv_batch_get(
+                    keys=batch.keys, partition_id=batch.partition_id, select_fields=["prompts", "responses"]
+                )
+                text_data["prompts"] = text_data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+                text_data["responses"] = text_data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+                all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
+                all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
+                sample_outputs.extend(all_outputs[i] for i in final_indices)
+                sample_inputs.extend(all_inputs[i] for i in final_indices)
+                dump_all_inputs.extend(all_inputs)
+                dump_all_outputs.extend(all_outputs)
 
             fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
             data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
 
             sample_uids.extend(data.pop("uid").tolist())
-            sample_outputs.extend(all_outputs[i] for i in final_indices)
-            sample_inputs.extend(all_inputs[i] for i in final_indices)
             scores = data["rm_scores"].sum(dim=1).tolist()
             sample_scores.extend(scores)
             sample_turns.extend(data.pop("num_turns").tolist())
@@ -1152,8 +1158,6 @@ class PPOTrainer(ABC):
             else:
                 data_sources.extend(["unknown"] * len(final_indices))
 
-            dump_all_inputs.extend(all_inputs)
-            dump_all_outputs.extend(all_outputs)
             dump_all_keys.extend(batch.keys)
 
             # 5. cleanup transfer queue
@@ -1163,7 +1167,6 @@ class PPOTrainer(ABC):
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump to local dir
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             # Sort according to uid (so that generations in the same rollout are together)
             sort_keys = []
