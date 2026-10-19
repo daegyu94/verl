@@ -23,12 +23,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 import torch
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 
+from verl.trainer.ppo.v1 import replay_buffer as replay_buffer_module
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
 
 # Small poll interval so the blocking consumer reacts to producer writes quickly.
@@ -478,6 +480,45 @@ def test_sample_blocks_until_enough_then_unblocks(tq_init, partition_id):
         assert len(batch.keys) == 2
     finally:
         consumer.join(timeout=10.0)
+        _clear_partition(partition_id)
+
+
+@pytest.mark.parametrize(
+    "n_prompts, n_running, n_missing, expected_interval",
+    [
+        (4, 4, 0, 2.0),  # nothing terminal yet: keep the configured interval
+        (4, 1, 0, 0.5),  # a quarter still in flight: poll 4x faster
+        (40, 1, 0, replay_buffer_module.MIN_SYNC_POLL_INTERVAL_SECONDS),  # tail: floored
+        (4, 0, 1, 2.0),  # nothing in flight: no tail to wait for
+    ],
+)
+def test_sync_poll_interval_scales_with_inflight_fraction(
+    tq_init, partition_id, monkeypatch, n_prompts, n_running, n_missing, expected_interval
+):
+    """Sync sample sleeps ``poll_interval`` scaled by the in-flight fraction, so the rollout tail
+    is polled quickly while the bulk of the rollout is polled at the configured interval."""
+    n_finished = n_prompts - n_running - n_missing
+    finished = [PromptSpec(uid=_uid(), status="finished") for _ in range(n_finished)]
+    running = [PromptSpec(uid=_uid(), status="running") for _ in range(n_running)]
+    _produce(partition_id, finished + running).join_and_check()
+
+    sleeps = []
+
+    def fake_sleep(interval):
+        sleeps.append(interval)
+        for spec in running:
+            _set_prompt_status(partition_id, spec.uid, "finished", global_steps=0)
+        missing = [PromptSpec(uid=_uid(), status="finished") for _ in range(n_missing)]
+        _produce(partition_id, missing).join_and_check()
+
+    # Replace only the module's view of ``time`` so TransferQueue and Ray keep the real one.
+    monkeypatch.setattr(replay_buffer_module, "time", SimpleNamespace(sleep=fake_sleep, time=time.time))
+    rb = _make_rb(poll_interval=2.0)
+    try:
+        batch = _sample(rb, partition_id, batch_size=n_prompts)
+        assert len(batch.keys) == n_prompts
+        assert sleeps == [pytest.approx(expected_interval)]
+    finally:
         _clear_partition(partition_id)
 
 

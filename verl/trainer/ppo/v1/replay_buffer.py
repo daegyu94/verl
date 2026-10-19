@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS", "60"))
+# Shortest sync sampling poll, used once (almost) no prompt is still in flight.
+MIN_SYNC_POLL_INTERVAL_SECONDS = 0.1
 
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
 FILTER_GROUPS_REWARD_METRIC = "reward"
@@ -405,8 +407,8 @@ class ReplayBuffer:
                 tags.append(tag)
         return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
 
-    def _wait_for_next_poll(self, partition_id: str, last_debug_time: float) -> float:
-        time.sleep(self.poll_interval)
+    def _wait_for_next_poll(self, partition_id: str, last_debug_time: float, interval: float | None = None) -> float:
+        time.sleep(self.poll_interval if interval is None else interval)
         now = time.time()
         if now - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:
             logger.info(
@@ -500,7 +502,15 @@ class ReplayBuffer:
                         eviction_metrics[key] = eviction_metrics.get(key, 0) + len(surplus_uids)
                 break
 
-            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
+            # Scale the poll interval with the in-flight fraction: the tail of a sync rollout is the step's
+            # critical path, and a fixed interval would idle up to ``poll_interval`` after the last group
+            # finishes, while the bulk of the rollout keeps the configured interval to avoid needless
+            # kv_list load on the TransferQueue controller. With nothing in flight there is no tail to wait for.
+            inflight_fraction = inflight_count / (inflight_count + len(sampleable_keys)) if inflight_count else 1.0
+            interval = min(
+                self.poll_interval, max(MIN_SYNC_POLL_INTERVAL_SECONDS, self.poll_interval * inflight_fraction)
+            )
+            last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time, interval)
 
         selected_uids = set(selected_prompt_uids)
         if partition_id != "val" and not any(key.split("_")[0] in selected_uids for key in partition_snapshot):
