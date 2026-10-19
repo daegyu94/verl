@@ -132,7 +132,8 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
     response_list = []
     # Skip padding dimensions after sequence dimensions, if any.
     skip_padding = (0, 0) * (values.ndim - 1)
-    for resp_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
+    # Move lengths/offsets to host once; iterating device scalars syncs on every slice and pad.
+    for resp_len, seq_offset in zip(response_lens.tolist(), sequence_offsets.tolist(), strict=True):
         pad_size = max_response_len - resp_len
         # left-shift model output by one token for log_probs/values
         response_list.append(F.pad(values[seq_offset - resp_len - 1 : seq_offset - 1], (*skip_padding, 0, pad_size)))
